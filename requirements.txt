@@ -6,3 +6,5 @@ numpy
 beautifulsoup4
 lxml
 openpyxl
+openai
+python-telegram-bot[job-queue]
