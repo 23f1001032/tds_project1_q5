@@ -19,7 +19,7 @@ LOG_URL = os.getenv(
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://tds-project1-q5-1.onrender.com")
 # --------------------------------------------------------------------------
 
-# Safety check to output descriptive error logs in Render instead of silently crashing
+# Safety check
 if not TELEGRAM_BOT_TOKEN:
     print("❌ CRITICAL ERROR: TELEGRAM_BOT_TOKEN is empty! Please check your Render Environment tab.")
 if not AIPIPE_TOKEN:
@@ -31,7 +31,7 @@ LOG_FILE = "run.jsonl"
 
 conversation_history = {}
 
-# Initialize the Bot Application (without the polling engine)
+# Initialize the Bot Application
 bot_app = (
     ApplicationBuilder()
     .token(TELEGRAM_BOT_TOKEN)
@@ -76,7 +76,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Stable model name to prevent 404/NotFoundError
+            model="gpt-4o-mini",
             messages=[{"role": "system", "content": system_prompt}] + history[-6:],
         )
         reply_text = response.choices[0].message.content.strip()
@@ -116,7 +116,7 @@ bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_messa
 async def lifespan(fastapi_app: FastAPI):
     """
     On startup, we initialize the Telegram application, set the webhook 
-    to our public Render URL, and clean it up when shutting down.
+    to our public Render URL, and start servicing traffic.
     """
     await bot_app.initialize()
     await bot_app.start()
@@ -128,13 +128,11 @@ async def lifespan(fastapi_app: FastAPI):
     else:
         print("⚠️ Warning: RENDER_EXTERNAL_URL is not set. Webhook was not established.")
         
-    yield
+    yield  # FastAPI handles web traffic here
     
-    print("🛑 Shutting down and deleting webhook...")
-    try:
-        await bot_app.bot.delete_webhook()
-    except Exception as e:
-        print(f"Error deleting webhook: {e}")
+    # ❌ FIX: We DO NOT call delete_webhook() on shutdown anymore!
+    # This prevents the old container from clearing the new container's webhook during deployment.
+    print("🛑 Shutting down FastAPI server...")
     await bot_app.stop()
     await bot_app.shutdown()
 
@@ -144,7 +142,7 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/telegram-webhook")
 async def process_update_webhook(request: Request):
     """
-    Telegram hits this endpoint with a POST request every time a update is received.
+    Endpoint where Telegram posts new messages.
     """
     try:
         req_json = await request.json()
