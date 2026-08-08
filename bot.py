@@ -4,32 +4,51 @@ import os
 from contextlib import asynccontextmanager
 from openai import OpenAI
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, ContextTypes, filters
-from fastapi import FastAPI
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
+from fastapi import FastAPI, Request, Response
+from http import HTTPStatus
 
-# --- CONFIGURATION (Environment Variables are best practice for Render!) ---
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "your-token-here")
-AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN", "your-token-bot-here")
+# --- CONFIGURATION (Environment Variables) ---
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN", "")
 LOG_URL = os.getenv(
     "LOG_URL", 
     "https://raw.githubusercontent.com/23f1001032/jsonl_file/refs/heads/main/run.jsonl"
 )
+# Render automatically provides RENDER_EXTERNAL_URL (e.g., https://your-service.onrender.com)
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 # --------------------------------------------------------------------------
 
 # Initialize OpenAI Client
 client = OpenAI(base_url="https://aipipe.org/openai/v1", api_key=AIPIPE_TOKEN)
 LOG_FILE = "run.jsonl"
 
-# Conversation history cache
 conversation_history = {}
+
+# Initialize the Bot Application (without the polling engine)
+bot_app = (
+    ApplicationBuilder()
+    .token(TELEGRAM_BOT_TOKEN)
+    .updater(None)  # Disable the background polling updater
+    .build()
+)
 
 def log_event(event: dict):
     event["timestamp"] = time.time()
     with open(LOG_FILE, "a") as f:
         f.write(json.dumps(event) + "\n")
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the /start command."""
+    greeting = (
+        "🤖 Hello! I am your AI Data Analyst Bot. I am active, online, and "
+        "monitoring updates. Send me a data-analysis question, and I will analyze "
+        "it and reply in the requested JSON format!"
+    )
+    await update.message.reply_text(greeting)
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Prevent bot from crashing if a message does not contain text or chat info
+    """Handles plain text messages."""
     if not update.effective_chat or not update.message or not update.message.text:
         return
         
@@ -49,24 +68,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "explanation, no markdown, no code fences, just the raw JSON."
     )
     
-    # Request completion from AIpipe
-    response = client.chat.completions.create(
-        model="gpt-5-mini",
-        messages=[{"role": "system", "content": system_prompt}] + history[-6:],
-    )
-    reply_text = response.choices[0].message.content.strip()
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Stable model name to prevent 404/NotFoundError
+            messages=[{"role": "system", "content": system_prompt}] + history[-6:],
+        )
+        reply_text = response.choices[0].message.content.strip()
+    except Exception as e:
+        reply_text = json.dumps({"error": f"AI completion failed: {str(e)}"})
+
     history.append({"role": "assistant", "content": reply_text})
 
-    # Gracefully format and clean up reply to ensure valid JSON output with log_url
+    # Bulletproof nested parser to completely prevent handler crashes
+    parsed = {}
     try:
         parsed = json.loads(reply_text)
     except json.JSONDecodeError:
-        # Fallback to extract first dictionary block if model adds commentary
-        start, end = reply_text.find("{"), reply_text.rfind("}")
-        if start != -1 and end != -1:
-            parsed = json.loads(reply_text[start:end + 1])
-        else:
-            parsed = {"error": "Could not parse AI response", "raw": reply_text}
+        try:
+            start, end = reply_text.find("{"), reply_text.rfind("}")
+            if start != -1 and end != -1:
+                parsed = json.loads(reply_text[start:end + 1])
+            else:
+                parsed = {"raw_response": reply_text}
+        except Exception:
+            parsed = {"raw_response": reply_text}
             
     parsed["log_url"] = LOG_URL
     final_reply = json.dumps(parsed)
@@ -74,45 +99,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_event({"type": "outgoing", "chat_id": chat_id, "text": final_reply})
     await update.message.reply_text(final_reply)
 
+# Register handlers
+bot_app.add_handler(CommandHandler("start", start_command))
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# --- RUN TELEGRAM CONCURRENTLY WITH FASTAPI ---
+
+# --- FASTAPI WEBHOOK INTEGRATION ---
 
 @asynccontextmanager
 async def lifespan(fastapi_app: FastAPI):
     """
-    This lifespan block runs on FastAPI startup, starts the Telegram bot
-    polling in the background, and stops it when the server stops.
+    On startup, we initialize the Telegram application, set the webhook 
+    to our public Render URL, and clean it up when shutting down.
     """
-    # 1. Setup the Telegram Application
-    bot_app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # 2. Start the Polling Engine asynchronously
     await bot_app.initialize()
     await bot_app.start()
-    await bot_app.updater.start_polling()
-    print("🚀 Telegram Bot is polling in the background...")
     
-    yield # FastAPI serves web traffic on port 8000 here
+    if RENDER_EXTERNAL_URL:
+        # We point the webhook to our FastAPI endpoint
+        webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
+        await bot_app.bot.set_webhook(url=webhook_url)
+        print(f"🚀 Webhook successfully set to: {webhook_url}")
+    else:
+        print("⚠️ Warning: RENDER_EXTERNAL_URL is not set. Webhook was not established.")
+        
+    yield
     
-    # 3. Graceful Shutdown
-    print("🛑 Shutting down Telegram Bot...")
-    await bot_app.updater.stop()
+    print("🛑 Shutting down and deleting webhook...")
+    try:
+        await bot_app.bot.delete_webhook()
+    except Exception as e:
+        print(f"Error deleting webhook: {e}")
     await bot_app.stop()
     await bot_app.shutdown()
-    print("✅ Offline.")
 
 
-# Instantiate the ASGI app that Uvicorn expects
 app = FastAPI(lifespan=lifespan)
+
+@app.post("/telegram-webhook")
+async def process_update_webhook(request: Request):
+    """
+    Telegram hits this endpoint with a POST request every time a user 
+    sends a message. We deserialize it and pass it to the bot.
+    """
+    try:
+        req_json = await request.json()
+        update = Update.de_json(req_json, bot_app.bot)
+        await bot_app.process_update(update)
+    except Exception as e:
+        print(f"Error processing update: {e}")
+    return Response(status_code=HTTPStatus.OK)
 
 @app.get("/")
 def health_check():
-    """
-    Render calls this endpoint to ensure your application is healthy.
-    Responding with 200 OK guarantees Render marks your deploy as successful!
-    """
     return {
         "status": "healthy", 
-        "details": "FastAPI is active and Telegram Bot is polling in the background!"
+        "details": "FastAPI is active.",
+        "webhook_url": f"{RENDER_EXTERNAL_URL}/telegram-webhook"
     }
