@@ -15,9 +15,15 @@ LOG_URL = os.getenv(
     "LOG_URL", 
     "https://raw.githubusercontent.com/23f1001032/jsonl_file/refs/heads/main/run.jsonl"
 )
-# Render automatically provides RENDER_EXTERNAL_URL (e.g., https://your-service.onrender.com)
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+# FALLBACK: We use your exact live Render URL if RENDER_EXTERNAL_URL is blank!
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "https://tds-project1-q5-1.onrender.com")
 # --------------------------------------------------------------------------
+
+# Safety check to output descriptive error logs in Render instead of silently crashing
+if not TELEGRAM_BOT_TOKEN:
+    print("❌ CRITICAL ERROR: TELEGRAM_BOT_TOKEN is empty! Please check your Render Environment tab.")
+if not AIPIPE_TOKEN:
+    print("❌ CRITICAL ERROR: AIPIPE_TOKEN is empty! Please check your Render Environment tab.")
 
 # Initialize OpenAI Client
 client = OpenAI(base_url="https://aipipe.org/openai/v1", api_key=AIPIPE_TOKEN)
@@ -29,7 +35,7 @@ conversation_history = {}
 bot_app = (
     ApplicationBuilder()
     .token(TELEGRAM_BOT_TOKEN)
-    .updater(None)  # Disable the background polling updater
+    .updater(None)  # Disable background polling
     .build()
 )
 
@@ -116,7 +122,6 @@ async def lifespan(fastapi_app: FastAPI):
     await bot_app.start()
     
     if RENDER_EXTERNAL_URL:
-        # We point the webhook to our FastAPI endpoint
         webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
         await bot_app.bot.set_webhook(url=webhook_url)
         print(f"🚀 Webhook successfully set to: {webhook_url}")
@@ -139,8 +144,7 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/telegram-webhook")
 async def process_update_webhook(request: Request):
     """
-    Telegram hits this endpoint with a POST request every time a user 
-    sends a message. We deserialize it and pass it to the bot.
+    Telegram hits this endpoint with a POST request every time a update is received.
     """
     try:
         req_json = await request.json()
